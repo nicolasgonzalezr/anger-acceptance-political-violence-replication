@@ -1,0 +1,2820 @@
+---
+title: "Analisis Edu"
+format: html
+editor: visual
+---
+
+# Anger and the acceptance of political violence
+
+## Preliminaries
+
+### Libraries
+
+```{r}
+
+library(tidyverse)
+library(lavaan)
+library(apollo)
+library(survival)
+library(lme4)
+```
+
+### Tuning parameters
+
+```{r}
+
+RNGkind("L'Ecuyer-CMRG")
+masterSeed <- 524
+
+export <- TRUE
+```
+
+### Data
+
+```{r}
+
+dataCollapsed <- read_csv("../Data/Base_Maestra_Experimento_Full_Variables_2.csv") %>%
+  mutate(
+    uniqueID = gsub("_", "", Subject_ID)
+  ) %>%
+  rename(
+    traitAnger = Trait_Anger,
+    assetScore = Asset_Score,
+    SES = SES_Index,
+    studyOrder = Order_First
+  ) %>%
+  select(uniqueID, traitAnger, assetScore, SES, studyOrder)
+
+response_alternatives <- c("NV", "NPV", "IPV", "RPV")
+
+dataLong <- read_csv("../Data/Base_Larga_Experimento_Final_1-44 - Base_Larga_Experimento_Final_1-44.csv") %>%
+  dplyr::filter(!is.na(winner_cat)) %>%
+  mutate(
+    uniqueID = paste0(Session_ID, Participant_ID),
+    winner_cat = replace_values(
+      winner_cat,
+      "VNP" ~ "NPV",
+      "VPI" ~ "IPV",
+      "VPR" ~ "RPV"
+    ),
+    loser_cat = replace_values(
+      loser_cat,
+      "VNP" ~ "NPV",
+      "VPI" ~ "IPV",
+      "VPR" ~ "RPV"
+    ),
+    isNV    = as.integer(str_detect(matchup, fixed("NV"))),
+    isNPV   = as.integer(str_detect(matchup, fixed("VNP"))),
+    isIPV   = as.integer(str_detect(matchup, fixed("VPI"))),
+    isRPV   = as.integer(str_detect(matchup, fixed("VPR"))),
+    NPV_NV   = ifelse(isNPV == 1 & isNV  == 1, 1, 0),
+    IPV_NV   = ifelse(isIPV == 1 & isNV  == 1, 1, 0),
+    RPV_NV   = ifelse(isRPV == 1 & isNV  == 1, 1, 0),
+    IPV_NPV  = ifelse(isIPV == 1 & isNPV == 1, 1, 0),
+    RPV_NPV  = ifelse(isRPV == 1 & isNPV == 1, 1, 0),
+    RPV_IPV  = ifelse(isRPV == 1 & isIPV == 1, 1, 0),
+    choice   = match(
+      as.character(winner_cat),
+      response_alternatives
+    ),
+    treat    = ifelse(tratamiento == "RABIA", 1, 0),
+    polId = left_right - 5,
+    trial = (trial_n - min(trial_n)),
+    trialReset = ifelse(trial_n <= 240, trial_n - min(trial_n), trial_n - min(trial_n) - 240),
+    logTrial = log(trial_n),
+    logTrialReset = log(ifelse(trial_n <= 240, trial_n, trial_n - 240)),
+    blockTwo = ifelse(trial_n > 240, 1, 0),
+    male = ifelse(sex=="Hombre", 1, 0),
+    age = as.numeric(scale(age)),
+    event = as.numeric(!timeout)
+  )
+
+mapping <- data.frame(
+  image     = c(dataLong$winner_img, dataLong$loser_img),
+  category  = c(dataLong$winner_cat, dataLong$loser_cat),
+  unity     = 1
+) %>%
+  distinct() %>%
+  group_by(category) %>%
+  mutate(
+    index = cumsum(unity)
+  ) %>%
+  ungroup() %>%
+  arrange(category, index) %>%
+  mutate(
+    imgID = paste0(index, "_", category)
+  ) %>%
+  select(-unity)
+
+dataLong <- dataLong %>%
+  mutate(
+    winner_img = mapping$imgID[match(winner_img, mapping$image)],
+    loser_img  = mapping$imgID[match(loser_img, mapping$image)]
+  ) %>%
+  dplyr::select(
+    uniqueID,
+    trial,
+    choice,
+    rt_ms,
+    treat,
+    polId,
+    male,
+    age,
+    trialReset,
+    logTrial,
+    logTrialReset,
+    blockTwo,
+    matchup,
+    event,
+    isNV,
+    isNPV,
+    isRPV,
+    isIPV,
+    NPV_NV,
+    IPV_NV,
+    RPV_NV,
+    IPV_NPV,
+    RPV_NPV,
+    RPV_IPV,
+    winner_img,
+    loser_img
+  )
+
+uniqueImages <- unique(c(dataLong$winner_img, dataLong$loser_img))
+
+imageMatrix <- do.call(
+  rbind,
+  lapply(
+    seq_len(nrow(dataLong)),
+    function(r){
+      img1 <- dataLong$winner_img[r]
+      img2 <- dataLong$loser_img[r]
+      
+      as.numeric(uniqueImages %in% c(img1, img2))
+    }
+  )
+)
+
+colnames(imageMatrix) <- uniqueImages
+
+# Check that only two images are listed for each trial
+sum(rowSums(imageMatrix)) / 2 == nrow(dataLong)
+
+imageMatrix <- as.data.frame(imageMatrix) %>%
+  mutate(
+    uniqueID = dataLong$uniqueID,
+    trial = dataLong$trial
+  )
+
+dataLong <- dataLong %>%
+  dplyr::select(
+    -c(winner_img, loser_img)
+  ) %>%
+  left_join(
+    dataCollapsed, by="uniqueID"
+  ) %>%
+  left_join(
+    imageMatrix, by = c("uniqueID", "trial")
+  )
+
+rm(imageMatrix)
+rm(dataCollapsed)
+```
+
+## Choice models
+
+### Intercepts baseline
+
+```{r}
+
+apollo_control <- list(
+  modelName  = "Nested MNL baseline",
+  modelDescr = "Paired-choice nested logit",
+  indivID    = "uniqueID",
+  panelData  = TRUE,
+  nCores     = 4
+)
+
+apollo_beta <- c(
+  b_intercept_NV  = 0,
+  b_intercept_NPV = 0,
+  b_intercept_IPV = 0,
+  b_intercept_RPV = 0,
+  
+  # Unrestricted parameters determining the nesting scales
+  eta_nest1 = qlogis(0.99)
+)
+
+apollo_fixed <- "b_intercept_NV"
+
+apollo_probabilities <- function(
+    apollo_beta,
+    apollo_inputs,
+    functionality = "estimate"
+) {
+  
+  apollo_attach(apollo_beta, apollo_inputs)
+  on.exit(
+    apollo_detach(apollo_beta, apollo_inputs),
+    add = TRUE
+  )
+  
+  # Utilities: NV is the reference alternative
+  V <- list(
+    NV = b_intercept_NV,
+    
+    NPV = b_intercept_NPV,
+    
+    IPV = b_intercept_IPV,
+    
+    RPV = b_intercept_RPV
+  )
+  
+  # Enforce 0 < lambda_nest2 < lambda_nest1 < 1
+  lambda_nest1 <- 1 / (1 + exp(-eta_nest1))
+  
+  nl_settings <- list(
+    alternatives = c(
+      NV  = 1,
+      NPV = 2,
+      IPV = 3,
+      RPV = 4
+    ),
+    
+    avail = list(
+      NV  = isNV,
+      NPV = isNPV,
+      IPV = isIPV,
+      RPV = isRPV
+    ),
+    
+    choiceVar = choice,
+    utilities = V,
+    
+    nlNests = list(
+      root  = 1,
+      nest1 = lambda_nest1
+    ),
+    
+    nlStructure = list(
+      root  = c("NV", "nest1"),
+      nest1 = c("NPV", "IPV", "RPV")
+    )
+  )
+  
+  P <- list()
+  
+  P[["model"]] <- apollo_nl(
+    nl_settings,
+    functionality
+  )
+  
+  P <- apollo_panelProd(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  P <- apollo_prepareProb(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  return(P)
+}
+
+apollo_inputs <- apollo_validateInputs(
+  apollo_beta    = apollo_beta,
+  apollo_fixed   = apollo_fixed,
+  database       = dataLong,
+  apollo_control = apollo_control,
+  recycle        = FALSE
+)
+
+interceptFit <- apollo_estimate(
+  apollo_beta,
+  apollo_fixed,
+  apollo_probabilities,
+  apollo_inputs
+)
+
+apollo_modelOutput(interceptFit)
+
+# Recover the estimated nesting scales
+lambda_nest1_hat <- plogis(
+  interceptFit$estimate[["eta_nest1"]]
+)
+
+c(
+  lambda_nest1 = lambda_nest1_hat
+)
+```
+
+### Interaction
+
+```{r}
+
+apollo_control <- list(
+  modelName  = "Nested MNL",
+  modelDescr = "Paired-choice nested logit",
+  indivID    = "uniqueID",
+  panelData  = TRUE,
+  nCores     = 4
+)
+
+apollo_beta <- c(
+  b_intercept_NV  = 0,
+  b_intercept_NPV = 0,
+  b_intercept_IPV = 0,
+  b_intercept_RPV = 0,
+  
+  b_treat_NPV  = 0,
+  b_treat_IPV = 0,
+  b_treat_RPV = 0,
+  
+  b_polId_NPV  = 0,
+  b_polId_IPV = 0,
+  b_polId_RPV = 0,
+  
+  b_interaction_NPV  = 0,
+  b_interaction_IPV = 0,
+  b_interaction_RPV = 0,
+
+  # Unrestricted parameters determining the nesting scales
+  eta_nest1 = qlogis(0.99),
+  eta_nest2 = qlogis(0.99)
+)
+
+apollo_fixed <- "b_intercept_NV"
+
+apollo_probabilities <- function(
+    apollo_beta,
+    apollo_inputs,
+    functionality = "estimate"
+) {
+  
+  apollo_attach(apollo_beta, apollo_inputs)
+  on.exit(
+    apollo_detach(apollo_beta, apollo_inputs),
+    add = TRUE
+  )
+  
+  # Utilities: NV is the reference alternative
+  V <- list(
+    NV = b_intercept_NV,
+    
+    NPV = b_intercept_NPV +
+      b_treat_NPV * treat +
+      b_polId_NPV * polId +
+      b_interaction_NPV * treat * polId,
+
+    IPV = b_intercept_IPV +
+      b_treat_IPV * treat +
+      b_polId_IPV * polId +
+      b_interaction_IPV * treat * polId,
+
+    RPV = b_intercept_RPV +
+      b_treat_RPV * treat +
+      b_polId_RPV * polId +
+      b_interaction_RPV * treat * polId
+  )
+  
+  # Enforce 0 < lambda_nest2 < lambda_nest1 < 1
+  lambda_nest1 <- 1 / (1 + exp(-eta_nest1))
+  
+  lambda_nest2 <- lambda_nest1 *
+    (1 / (1 + exp(-eta_nest2)))
+  
+  nl_settings <- list(
+    alternatives = c(
+      NV  = 1,
+      NPV = 2,
+      IPV = 3,
+      RPV = 4
+    ),
+    
+    avail = list(
+      NV  = isNV,
+      NPV = isNPV,
+      IPV = isIPV,
+      RPV = isRPV
+    ),
+    
+    choiceVar = choice,
+    utilities = V,
+    
+    nlNests = list(
+      root  = 1,
+      nest1 = lambda_nest1,
+      nest2 = lambda_nest2
+    ),
+    
+    nlStructure = list(
+      root  = c("NV", "nest1"),
+      nest1 = c("NPV", "nest2"),
+      nest2 = c("IPV", "RPV")
+    )
+  )
+  
+  P <- list()
+  
+  P[["model"]] <- apollo_nl(
+    nl_settings,
+    functionality
+  )
+  
+  P <- apollo_panelProd(
+    P,
+    apollo_inputs,
+    functionality
+  )
+
+  P <- apollo_prepareProb(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  return(P)
+}
+
+apollo_inputs <- apollo_validateInputs(
+  apollo_beta    = apollo_beta,
+  apollo_fixed   = apollo_fixed,
+  database       = dataLong,
+  apollo_control = apollo_control,
+  recycle        = FALSE
+)
+
+interactionfit <- apollo_estimate(
+  apollo_beta,
+  apollo_fixed,
+  apollo_probabilities,
+  apollo_inputs
+)
+
+apollo_modelOutput(interactionfit)
+
+# Recover the estimated nesting scales
+lambda_nest1_hat <- plogis(
+  interactionfit$estimate[["eta_nest1"]]
+)
+
+lambda_nest2_hat <- lambda_nest1_hat * plogis(
+  interactionfit$estimate[["eta_nest2"]]
+)
+
+c(
+  lambda_nest1 = lambda_nest1_hat,
+  lambda_nest2 = lambda_nest2_hat
+)
+
+# Build the four coefficient contrasts for a given pair
+make_contrast <- function(a, b, inverse_scale) {
+  
+  prefixes <- c(
+    intercept   = "b_intercept",
+    treat       = "b_treat",
+    polId       = "b_polId",
+    interaction = "b_interaction"
+  )
+  
+  expressions <- sprintf(
+    "(%s_%s - %s_%s) * (%s)",
+    prefixes, a,
+    prefixes, b,
+    inverse_scale
+  )
+  
+  setNames(
+    expressions,
+    paste(a, b, names(prefixes), sep = "_SEP_")
+  )
+}
+
+contrast_expressions <- c(
+  make_contrast(
+    "IPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "IPV",
+    "(1 + exp(-eta_nest1)) * (1 + exp(-eta_nest2))"
+  )
+)
+```
+
+##### HTML
+
+```{r}
+
+outcomeLevels <- c(
+  "NV",
+  "NPV",
+  "IPV",       
+  "RPV"
+)
+
+outcomeLabels <- c(
+  "NV",
+  "NPV",
+  "IPV",       
+  "RPV"
+)
+
+termLevels <- c(
+  "treat",
+  "polId",       
+  "interaction",   
+  "intercept"
+)
+
+termLabels <- c(
+  "Treatment",
+  "Left-Right (C)",       
+  "Treatment × Left-Right",
+  "Intercept"
+)
+
+interactionTable <- apollo_modelOutput(
+  interactionfit,
+  list(
+    printClassical = FALSE,
+    printRobust    = TRUE,
+    printPVal      = 2,
+    printFixed     = FALSE
+  )
+)
+
+lambda1 <- 1 / (1 + exp(-interactionTable["eta_nest1", "Estimate"]))
+lambda2 <- lambda1 * 1 / (1 + exp(-interactionTable["eta_nest2", "Estimate"]))
+
+contrast_results <- apollo_deltaMethod(
+  interactionfit,
+  list(
+    expression = contrast_expressions,
+    varcov = "robust",
+    printPVal = 2
+  )
+)
+
+interactionDelta <- tibble::as_tibble(contrast_results) %>%
+  tidyr::separate_wider_delim(
+    Expression,
+    delim = "_SEP_",
+    names = c("Outcome", "Panel", "Term")
+  ) %>%
+  rename(
+    Estimate = Value,
+    se = s.e.,
+    t = `t-ratio (0)`,
+    p = `p(2-sided)`
+  )
+
+interactionTable <- tibble::as_tibble(
+  interactionTable,
+  rownames = "Term"
+) %>%
+  filter(!startsWith(Term, "eta")) %>%
+  mutate(
+    Panel = "NV",
+    Outcome = str_extract(Term, "[^_]*$"),
+    Term = str_remove(str_remove(Term, "_[^_]*$"), "^[^_]*_")
+  ) %>%
+  rename(
+    se = Rob.s.e.,
+    t = `Rob.t.rat.(0)`,
+    p = `p(2-sided)`
+  ) %>%
+  dplyr::bind_rows(interactionDelta) %>%
+  mutate(
+    Term = factor(
+      Term, levels = termLevels, labels = termLabels
+    ),
+    Outcome = factor(
+      Outcome, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    Panel = factor(
+      Panel, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    stars = case_when(
+      p <= 0.001 ~ "***",
+      p <= 0.01  ~ "**",
+      p <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      p < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", p)))
+    ),
+    Estimate = sprintf(
+      "%.3f%s<br>(%.3f)<br>p%s",
+      Estimate, stars, se, pFormatted
+    )
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = Term,
+    names_from = c(Panel, Outcome),
+    values_from = Estimate,
+    names_sep = "_",
+    names_expand = FALSE
+  ) %>%
+  arrange(Term)
+
+interactionGT <- interactionTable %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NV",
+    columns = starts_with("NV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NPV",
+    columns = starts_with("NPV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: IPV",
+    columns = starts_with("IPV")
+  ) %>%
+  gt::cols_label(
+    ends_with("NPV") ~ "NPV",
+    ends_with("IPV") ~ "IPV",
+    ends_with("RPV") ~ "RPV"
+  ) %>%
+  gt::fmt_markdown(
+    columns = -Term
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = -Term
+  ) %>%
+  gt::sub_missing(
+    columns = -Term,
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(weight = "bold"),
+    locations = gt::cells_row_groups(
+      groups = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0)
+  )
+
+interactionGT
+
+if(export) {
+  interactionGT_png <- interactionGT %>%
+    gt::tab_options(
+      table.width = gt::px(624)
+    )
+  
+  gt::gtsave(
+    interactionGT_png,
+    filename = "../Tables/interactionTable.png",
+    zoom = 3.125,
+    expand = 0
+  ) 
+}
+```
+
+### Trial dynamics
+
+#### Log trial
+
+```{r}
+
+apollo_control <- list(
+  modelName  = "Nested MNL, log trial",
+  modelDescr = "Paired-choice nested logit",
+  indivID    = "uniqueID",
+  panelData  = TRUE,
+  nCores     = 4
+)
+
+apollo_beta <- c(
+  b_intercept_NV  = 0,
+  b_intercept_NPV = 0,
+  b_intercept_IPV = 0,
+  b_intercept_RPV = 0,
+  
+  b_treat_NPV  = 0,
+  b_treat_IPV = 0,
+  b_treat_RPV = 0,
+  
+  b_polId_NPV  = 0,
+  b_polId_IPV = 0,
+  b_polId_RPV = 0,
+  
+#  b_polId_trial_NPV = 0,
+#  b_polId_trial_IPV = 0,
+#  b_polId_trial_RPV = 0,
+  
+  b_interaction_NPV  = 0,
+  b_interaction_IPV = 0,
+  b_interaction_RPV = 0,
+  
+  b_trial_NPV  = 0,
+  b_trial_IPV = 0,
+  b_trial_RPV = 0,
+
+  b_blockTwo_NPV  = 0,
+  b_blockTwo_IPV = 0,
+  b_blockTwo_RPV = 0,
+
+  b_trial_blockTwo_NPV  = 0,
+  b_trial_blockTwo_IPV = 0,
+  b_trial_blockTwo_RPV = 0,
+
+#  b_trialSq_NPV  = 0,
+#  b_trialSq_IPV = 0,
+#  b_trialSq_RPV = 0,
+
+#  b_trialTwo_NPV  = 0,
+#  b_trialTwo_IPV = 0,
+#  b_trialTwo_RPV = 0,
+  
+#  b_trialTwoSq_NPV  = 0,
+#  b_trialTwoSq_IPV = 0,
+#  b_trialTwoSq_RPV = 0,
+  
+  b_treat_trial_NPV  = 0,
+  b_treat_trial_IPV = 0,
+  b_treat_trial_RPV = 0,
+  
+#  b_interaction_trial_NPV  = 0,
+#  b_interaction_trial_IPV = 0,
+#  b_interaction_trial_RPV = 0,
+
+  b_age_NPV  = 0,
+  b_age_IPV = 0,
+  b_age_RPV = 0,
+
+  b_male_NPV  = 0,
+  b_male_IPV = 0,
+  b_male_RPV = 0,
+
+#  b_traitAnger_NPV  = 0,
+#  b_traitAnger_IPV = 0,
+#  b_traitAnger_RPV = 0,
+
+#  b_SES_NPV  = 0,
+#  b_SES_IPV = 0,
+#  b_SES_RPV = 0,
+
+#  b_studyOrder_NPV  = 0,
+#  b_studyOrder_IPV = 0,
+#  b_studyOrder_RPV = 0,
+  
+  # Unrestricted parameters determining the nesting scales
+  eta_nest1 = qlogis(0.99),
+  eta_nest2 = qlogis(0.99)
+)
+
+apollo_fixed <- "b_intercept_NV"
+
+apollo_probabilities <- function(
+    apollo_beta,
+    apollo_inputs,
+    functionality = "estimate"
+) {
+  
+  apollo_attach(apollo_beta, apollo_inputs)
+  on.exit(
+    apollo_detach(apollo_beta, apollo_inputs),
+    add = TRUE
+  )
+  
+  # Utilities: NV is the reference alternative
+  V <- list(
+    NV = b_intercept_NV,
+    
+    NPV = b_intercept_NPV +
+      b_age_NPV * age +
+      b_male_NPV * male +
+      b_treat_NPV * treat +
+      b_polId_NPV * polId +
+      b_trial_NPV * logTrial +
+      b_blockTwo_NPV * blockTwo +
+      b_trial_blockTwo_NPV * logTrial * blockTwo +
+#      b_trialSq_NPV * trial^2 +
+#      b_trialTwo_NPV * trial*blockTwo +
+#      b_trialTwoSq_NPV * trial^2 * blockTwo +
+      b_interaction_NPV * treat * polId +
+      b_treat_trial_NPV * treat * logTrial,
+#      b_traitAnger_NPV * traitAnger +
+#      b_SES_NPV * SES +
+#      b_studyOrder_NPV * studyOrder,
+#      b_polId_trial_NPV * polId * logTrial,
+#      b_interaction_trial_NPV * treat * polId * logTrial,
+    
+    IPV = b_intercept_IPV +
+      b_age_IPV * age +
+      b_male_IPV * male +
+      b_treat_IPV * treat +
+      b_polId_IPV * polId +
+      b_trial_IPV * logTrial +
+      b_blockTwo_IPV * blockTwo +
+      b_trial_blockTwo_IPV * logTrial * blockTwo +
+#      b_trialSq_IPV * trial^2 +
+#      b_trialTwo_IPV * trial*blockTwo +
+#      b_trialTwoSq_IPV * trial^2 * blockTwo +
+      b_interaction_IPV * treat * polId +
+      b_treat_trial_IPV * treat * logTrial,
+#      b_traitAnger_IPV * traitAnger +
+#      b_SES_IPV * SES +
+#      b_studyOrder_IPV * studyOrder,
+#      b_polId_trial_IPV * polId * logTrial,
+#      b_interaction_trial_IPV * treat * polId * logTrial,
+    
+    RPV = b_intercept_RPV +
+      b_age_RPV * age +
+      b_male_RPV * male +
+      b_treat_RPV * treat +
+      b_polId_RPV * polId +
+      b_trial_RPV * logTrial +
+      b_blockTwo_RPV * blockTwo +
+      b_trial_blockTwo_RPV * logTrial * blockTwo +
+#      b_trialSq_RPV * trial^2 +
+#      b_trialTwo_RPV * trial * blockTwo +
+#      b_trialTwoSq_RPV * trial^2 * blockTwo +
+      b_interaction_RPV * treat * polId +
+      b_treat_trial_RPV * treat * logTrial
+#      b_traitAnger_RPV * traitAnger +
+#      b_SES_RPV * SES +
+#      b_studyOrder_RPV * studyOrder
+#      b_polId_trial_RPV * polId * logTrial +
+#      b_interaction_trial_RPV * treat * polId * logTrial
+  )
+  
+  # Enforce 0 < lambda_nest2 < lambda_nest1 < 1
+  lambda_nest1 <- 1 / (1 + exp(-eta_nest1))
+  
+  lambda_nest2 <- lambda_nest1 *
+    (1 / (1 + exp(-eta_nest2)))
+  
+  nl_settings <- list(
+    alternatives = c(
+      NV  = 1,
+      NPV = 2,
+      IPV = 3,
+      RPV = 4
+    ),
+    
+    avail = list(
+      NV  = isNV,
+      NPV = isNPV,
+      IPV = isIPV,
+      RPV = isRPV
+    ),
+    
+    choiceVar = choice,
+    utilities = V,
+    
+    nlNests = list(
+      root  = 1,
+      nest1 = lambda_nest1,
+      nest2 = lambda_nest2
+    ),
+    
+    nlStructure = list(
+      root  = c("NV", "nest1"),
+      nest1 = c("NPV", "nest2"),
+      nest2 = c("IPV", "RPV")
+    )
+  )
+  
+  P <- list()
+  
+  P[["model"]] <- apollo_nl(
+    nl_settings,
+    functionality
+  )
+  
+  P <- apollo_panelProd(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  P <- apollo_prepareProb(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  return(P)
+}
+
+apollo_inputs <- apollo_validateInputs(
+  apollo_beta    = apollo_beta,
+  apollo_fixed   = apollo_fixed,
+  database       = dataLong,
+  apollo_control = apollo_control,
+  recycle        = FALSE
+)
+
+logTrialFit <- apollo_estimate(
+  apollo_beta,
+  apollo_fixed,
+  apollo_probabilities,
+  apollo_inputs
+)
+
+apollo_modelOutput(logTrialFit)
+
+# Recover the estimated nesting scales
+lambda_nest1_hat <- plogis(
+  logTrialFit$estimate[["eta_nest1"]]
+)
+
+lambda_nest2_hat <- lambda_nest1_hat * plogis(
+  logTrialFit$estimate[["eta_nest2"]]
+)
+
+c(
+  lambda_nest1 = lambda_nest1_hat,
+  lambda_nest2 = lambda_nest2_hat
+)
+
+
+make_contrast <- function(a, b, inverse_scale) {
+  
+  prefixes <- c(
+    intercept         = "b_intercept",
+    age               = "b_age",
+    male              = "b_male",
+#    traitAnger        = "b_traitAnger",
+#    SES               = "b_SES",
+#    studyOrder        = "b_studyOrder",
+    treat             = "b_treat",
+    polId             = "b_polId",
+    interaction       = "b_interaction",
+    trial             = "b_trial",
+    blockTwo          = "b_blockTwo",
+    trial_blockTwo    = "b_trial_blockTwo",
+#    trialSq           = "b_trialSq",
+#    trialTwo          = "b_trialTwo",
+#    trialTwoSq        = "b_trialTwoSq"
+    treat_trial       = "b_treat_trial"
+#    polId_trial       = "b_polId_trial",
+#    interaction_trial = "b_interaction_trial"
+  )
+  
+  # Include only terms estimated for both alternatives.
+  # This accommodates models with or without polId × trial.
+  included <- vapply(
+    prefixes,
+    function(prefix) {
+      all(
+        paste0(prefix, "_", c(a, b)) %in%
+          names(logTrialFit$estimate)
+      )
+    },
+    logical(1)
+  )
+  
+  prefixes <- prefixes[included]
+  
+  expressions <- sprintf(
+    "(%s_%s - %s_%s) * (%s)",
+    prefixes, a,
+    prefixes, b,
+    inverse_scale
+  )
+  
+  setNames(
+    expressions,
+    paste(a, b, names(prefixes), sep = "_SEP_")
+  )
+}
+
+contrast_expressions <- c(
+  make_contrast(
+    "IPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "IPV",
+    "(1 + exp(-eta_nest1)) * (1 + exp(-eta_nest2))"
+  )
+)
+
+contrast_results <- apollo_deltaMethod(
+  logTrialFit,
+  list(
+    expression = contrast_expressions,
+    varcov = "robust",
+    printPVal = 2
+  )
+)
+```
+
+##### HTML
+
+```{r}
+
+outcomeLevels <- c(
+  "NV",
+  "NPV",
+  "IPV",
+  "RPV"
+)
+
+outcomeLabels <- c(
+  "NV",
+  "NPV",
+  "IPV",       
+  "RPV"
+)
+
+termLevels <- c(
+  "treat",
+  "treat_trial",
+  "polId",       
+  "polId_trial",
+  "interaction",   
+  "interaction_trial",
+  "blockTwo",
+  "trial",
+  "trial_blockTwo",
+#  "trialSq",
+#  "trialTwo",
+#  "trialTwoSq",
+  "male",
+  "age",
+  "traitAnger",
+  "SES",
+  "studyOrder",
+  "intercept"
+)
+
+termLabels <- c(
+  "Treatment",
+  "Treatment × Trial",
+  "Left-Right (C)",       
+  "Left-Right × Trial",
+  "Treatment × Left-Right",
+  "Treatment × Left-Right × Trial",
+  "Block Two",
+  "Trial",
+  "Trial × Block Two",
+#  "Trial²",
+#  "Trial (2)",
+#  "Trial² (2)",
+  "Male",
+  "Age",
+  "Trait Anger",
+  "SES",
+  "Study Order",
+  "Intercept"
+)
+
+modelLabels <- c("NPV_NV", "IPV_NV", "RPV_NV", "IPV_NPV", "RPV_NPV", "RPV_IPV")
+
+logTrialTable <- apollo_modelOutput(
+  logTrialFit,
+  list(
+    printClassical = FALSE,
+    printRobust    = TRUE,
+    printPVal      = 2,
+    printFixed     = FALSE
+  )
+)
+
+lambda1 <- 1 / (1 + exp(-logTrialTable["eta_nest1", "Estimate"]))
+lambda2 <- lambda1 * 1 / (1 + exp(-logTrialTable["eta_nest2", "Estimate"]))
+
+logTrialDelta <- tibble::as_tibble(contrast_results) %>%
+  tidyr::separate_wider_delim(
+    Expression,
+    delim = "_SEP_",
+    names = c("Category", "Reference", "Term")
+  ) %>%
+  rename(
+    Estimate = Value,
+    se = s.e.,
+    t = `t-ratio (0)`,
+    p = `p(2-sided)`
+  )
+
+logTrialTable <- tibble::as_tibble(
+  logTrialTable,
+  rownames = "Term"
+) %>%
+  filter(!startsWith(Term, "eta")) %>%
+  mutate(
+    Reference = "NV",
+    Category = str_extract(Term, "[^_]*$"),
+    Term = str_remove(str_remove(Term, "_[^_]*$"), "^[^_]*_")
+  ) %>%
+  rename(
+    se = Rob.s.e.,
+    t = `Rob.t.rat.(0)`,
+    p = `p(2-sided)`
+  ) %>%
+  dplyr::bind_rows(logTrialDelta) %>%
+  mutate(
+    Term = factor(
+      Term, levels = termLevels, labels = termLabels
+    ),
+    Category = factor(
+      Category, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    Reference = factor(
+      Reference, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    Panel = "Coefficients",
+    stars = case_when(
+      p <= 0.001 ~ "***",
+      p <= 0.01  ~ "**",
+      p <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      p < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", p)))
+    ),
+    Estimate = sprintf(
+      "%.3f%s<br>(%.3f)<br>p%s",
+      Estimate, stars, se, pFormatted
+    )
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = c(Term, Panel),
+    names_from = c(Category, Reference),
+    values_from = Estimate,
+    names_sep = "_",
+    names_expand = FALSE
+  ) %>%
+  arrange(Term)
+
+infoValues <- c(
+  sprintf("%.3f", logTrialFit$rho2_0),
+  sprintf(
+    "%.3f",
+    as.numeric(1 - logTrialFit$maximum / interceptFit$maximum)
+  ),
+  sprintf("%.0f", logTrialFit$nObs),
+  sprintf("%.0f", logTrialFit$nIndivs)
+)
+
+modelInfo <- tibble::tibble(
+  Term = c("R² (equal)", "R² (base)", "N", "Clusters"),
+  Panel = "Info",
+  !!!setNames(
+    rep(list(infoValues), length(modelLabels)),
+    modelLabels
+  )
+)
+
+logTrialTable <- dplyr::bind_rows(logTrialTable, modelInfo)
+
+logTrialGT <- logTrialTable %>%
+  dplyr::select(-Panel) %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NV",
+    columns = ends_with("NV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NPV",
+    columns = ends_with("NPV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: IPV",
+    columns = ends_with("IPV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Choice",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_label(
+    starts_with("NPV") ~ "NPV",
+    starts_with("IPV") ~ "IPV",
+    starts_with("RPV") ~ "RPV"
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Choice"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "R² (equal)"
+      ),
+      gt::cells_body(
+        rows = Term == "R² (equal)"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+logTrialGT
+
+if(export) {
+  logTrialGT_png <- logTrialGT %>%
+    gt::tab_options(
+      table.width = gt::px(624)
+    )
+  
+  gt::gtsave(
+    logTrialGT_png,
+    filename = "../Tables/logTrialTable.png",
+    zoom = 3.125,
+    expand = 0
+  ) 
+}
+```
+
+#### Log trial reset
+
+```{r}
+
+apollo_control <- list(
+  modelName  = "Nested MNL, log trial reset",
+  modelDescr = "Paired-choice nested logit",
+  indivID    = "uniqueID",
+  panelData  = TRUE,
+  nCores     = 4
+)
+
+apollo_beta <- c(
+  b_intercept_NV  = 0,
+  b_intercept_NPV = 0,
+  b_intercept_IPV = 0,
+  b_intercept_RPV = 0,
+  
+  b_treat_NPV  = 0,
+  b_treat_IPV = 0,
+  b_treat_RPV = 0,
+  
+  b_polId_NPV  = 0,
+  b_polId_IPV = 0,
+  b_polId_RPV = 0,
+  
+  b_polId_trial_NPV = 0,
+  b_polId_trial_IPV = 0,
+  b_polId_trial_RPV = 0,
+  
+  b_interaction_NPV  = 0,
+  b_interaction_IPV = 0,
+  b_interaction_RPV = 0,
+  
+  b_trial_NPV  = 0,
+  b_trial_IPV = 0,
+  b_trial_RPV = 0,
+  
+  b_treat_trial_NPV  = 0,
+  b_treat_trial_IPV = 0,
+  b_treat_trial_RPV = 0,
+  
+  b_interaction_trial_NPV  = 0,
+  b_interaction_trial_IPV = 0,
+  b_interaction_trial_RPV = 0,
+  
+  # Unrestricted parameters determining the nesting scales
+  eta_nest1 = qlogis(0.99),
+  eta_nest2 = qlogis(0.99)
+)
+
+apollo_fixed <- "b_intercept_NV"
+
+apollo_probabilities <- function(
+    apollo_beta,
+    apollo_inputs,
+    functionality = "estimate"
+) {
+  
+  apollo_attach(apollo_beta, apollo_inputs)
+  on.exit(
+    apollo_detach(apollo_beta, apollo_inputs),
+    add = TRUE
+  )
+  
+  # Utilities: NPV is the reference alternative
+  V <- list(
+    NV = b_intercept_NV,
+    
+    NPV = b_intercept_NPV +
+      b_treat_NPV * treat +
+      b_polId_NPV * polId +
+      b_trial_NPV * logTrialReset +
+      b_interaction_NPV * treat * polId +
+      b_treat_trial_NPV * treat * logTrialReset +
+      b_polId_trial_NPV * polId * logTrialReset +
+      b_interaction_trial_NPV * treat * polId * logTrialReset,
+    
+    IPV = b_intercept_IPV +
+      b_treat_IPV * treat +
+      b_polId_IPV * polId +
+      b_trial_IPV * logTrialReset +
+      b_interaction_IPV * treat * polId +
+      b_treat_trial_IPV * treat * logTrialReset +
+      b_polId_trial_IPV * polId * logTrialReset +
+      b_interaction_trial_IPV * treat * polId * logTrialReset,
+    
+    RPV = b_intercept_RPV +
+      b_treat_RPV * treat +
+      b_polId_RPV * polId +
+      b_trial_RPV * logTrial +
+      b_interaction_RPV * treat * polId +
+      b_treat_trial_RPV * treat * logTrial +
+      b_polId_trial_RPV * polId * logTrial +
+      b_interaction_trial_RPV * treat * polId * logTrial
+  )
+  
+  # Enforce 0 < lambda_nest2 < lambda_nest1 < 1
+  lambda_nest1 <- 1 / (1 + exp(-eta_nest1))
+  
+  lambda_nest2 <- lambda_nest1 *
+    (1 / (1 + exp(-eta_nest2)))
+  
+  nl_settings <- list(
+    alternatives = c(
+      NV  = 1,
+      NPV = 2,
+      IPV = 3,
+      RPV = 4
+    ),
+    
+    avail = list(
+      NV  = isNV,
+      NPV = isNPV,
+      IPV = isIPV,
+      RPV = isRPV
+    ),
+    
+    choiceVar = choice,
+    utilities = V,
+    
+    nlNests = list(
+      root  = 1,
+      nest1 = lambda_nest1,
+      nest2 = lambda_nest2
+    ),
+    
+    nlStructure = list(
+      root  = c("NV", "nest1"),
+      nest1 = c("NPV", "nest2"),
+      nest2 = c("IPV", "RPV")
+    )
+  )
+  
+  P <- list()
+  
+  P[["model"]] <- apollo_nl(
+    nl_settings,
+    functionality
+  )
+  
+  P <- apollo_panelProd(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  P <- apollo_prepareProb(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  return(P)
+}
+
+apollo_inputs <- apollo_validateInputs(
+  apollo_beta    = apollo_beta,
+  apollo_fixed   = apollo_fixed,
+  database       = dataLong,
+  apollo_control = apollo_control,
+  recycle        = FALSE
+)
+
+logTrialResetFit <- apollo_estimate(
+  apollo_beta,
+  apollo_fixed,
+  apollo_probabilities,
+  apollo_inputs
+)
+
+apollo_modelOutput(logTrialResetFit)
+
+# Recover the estimated nesting scales
+lambda_nest1_hat <- plogis(
+  logTrialResetFit$estimate[["eta_nest1"]]
+)
+
+lambda_nest2_hat <- lambda_nest1_hat * plogis(
+  logTrialResetFit$estimate[["eta_nest2"]]
+)
+
+c(
+  lambda_nest1 = lambda_nest1_hat,
+  lambda_nest2 = lambda_nest2_hat
+)
+
+make_contrast <- function(a, b, inverse_scale) {
+  
+  prefixes <- c(
+    intercept         = "b_intercept",
+    treat             = "b_treat",
+    polId             = "b_polId",
+    interaction       = "b_interaction",
+    trial             = "b_trial",
+    treat_trial       = "b_treat_trial",
+    polId_trial       = "b_polId_trial",
+    interaction_trial = "b_interaction_trial"
+  )
+  
+  # Include only terms estimated for both alternatives.
+  # This accommodates models with or without polId × trial.
+  included <- vapply(
+    prefixes,
+    function(prefix) {
+      all(
+        paste0(prefix, "_", c(a, b)) %in%
+          names(logTrialResetFit$estimate)
+      )
+    },
+    logical(1)
+  )
+  
+  prefixes <- prefixes[included]
+  
+  expressions <- sprintf(
+    "(%s_%s - %s_%s) * (%s)",
+    prefixes, a,
+    prefixes, b,
+    inverse_scale
+  )
+  
+  setNames(
+    expressions,
+    paste(a, b, names(prefixes), sep = "_SEP_")
+  )
+}
+
+contrast_expressions <- c(
+  make_contrast(
+    "IPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "IPV",
+    "(1 + exp(-eta_nest1)) * (1 + exp(-eta_nest2))"
+  )
+)
+
+contrast_results <- apollo_deltaMethod(
+  logTrialResetFit,
+  list(
+    expression = contrast_expressions,
+    varcov = "robust",
+    printPVal = 2
+  )
+)
+```
+
+##### HTML
+
+```{r}
+
+outcomeLevels <- c(
+  "NV",
+  "NPV",
+  "IPV",       
+  "RPV"
+)
+
+outcomeLabels <- c(
+  "NV",
+  "NPV",
+  "IPV",       
+  "RPV"
+)
+
+termLevels <- c(
+  "treat",
+  "treat_trial",
+  "polId",       
+  "polId_trial",
+  "interaction",   
+  "interaction_trial",
+  "trial",
+  "intercept"
+)
+
+termLabels <- c(
+  "Treatment",
+  "Treatment × Trial",
+  "Left-Right (C)",       
+  "Left-Right × Trial",
+  "Treatment × Left-Right",
+  "Treatment × Left-Right × Trial",
+  "Trial",
+  "Intercept"
+)
+
+logTrialResetTable <- apollo_modelOutput(
+  logTrialResetFit,
+  list(
+    printClassical = FALSE,
+    printRobust    = TRUE,
+    printPVal      = 2,
+    printFixed     = FALSE
+  )
+)
+
+lambda1 <- 1 / (1 + exp(-logTrialResetTable["eta_nest1", "Estimate"]))
+lambda2 <- lambda1 * 1 / (1 + exp(-logTrialResetTable["eta_nest2", "Estimate"]))
+
+
+logTrialResetDelta <- tibble::as_tibble(contrast_results) %>%
+  tidyr::separate_wider_delim(
+    Expression,
+    delim = "_SEP_",
+    names = c("Outcome", "Panel", "Term")
+  ) %>%
+  rename(
+    Estimate = Value,
+    se = s.e.,
+    t = `t-ratio (0)`,
+    p = `p(2-sided)`
+  )
+
+logTrialResetTable <- tibble::as_tibble(
+  logTrialResetTable,
+  rownames = "Term"
+) %>%
+  filter(!startsWith(Term, "eta")) %>%
+  mutate(
+    Panel = "NV",
+    Outcome = str_extract(Term, "[^_]*$"),
+    Term = str_remove(str_remove(Term, "_[^_]*$"), "^[^_]*_")
+  ) %>%
+  rename(
+    se = Rob.s.e.,
+    t = `Rob.t.rat.(0)`,
+    p = `p(2-sided)`
+  ) %>%
+  dplyr::bind_rows(logTrialResetDelta) %>%
+  mutate(
+    Term = factor(
+      Term, levels = termLevels, labels = termLabels
+    ),
+    Outcome = factor(
+      Outcome, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    Panel = factor(
+      Panel, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    stars = case_when(
+      p <= 0.001 ~ "***",
+      p <= 0.01  ~ "**",
+      p <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      p < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", p)))
+    ),
+    Estimate = sprintf(
+      "%.3f%s<br>(%.3f)<br>p%s",
+      Estimate, stars, se, pFormatted
+    )
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = Term,
+    names_from = c(Panel, Outcome),
+    values_from = Estimate,
+    names_sep = "_",
+    names_expand = FALSE
+  ) %>%
+  arrange(Term)
+
+logTrialResetGT <- logTrialResetTable %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NV",
+    columns = starts_with("NV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NPV",
+    columns = starts_with("NPV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: IPV",
+    columns = starts_with("IPV")
+  ) %>%
+  gt::cols_label(
+    ends_with("NPV") ~ "NPV",
+    ends_with("IPV") ~ "IPV",
+    ends_with("RPV") ~ "RPV"
+  ) %>%
+  gt::fmt_markdown(
+    columns = -Term
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = -Term
+  ) %>%
+  gt::sub_missing(
+    columns = -Term,
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(weight = "bold"),
+    locations = gt::cells_row_groups(
+      groups = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0)
+  )
+
+logTrialResetGT
+
+if(export) {
+  logTrialResetGT_png <- logTrialResetGT %>%
+    gt::tab_options(
+      table.width = gt::px(624)
+    )
+  
+  gt::gtsave(
+    logTrialResetGT_png,
+    filename = "../Tables/logTrialResetTable.png",
+    zoom = 3.125,
+    expand = 0
+  ) 
+}
+```
+
+### Image fixed effects
+
+```{r}
+
+apollo_control <- list(
+  modelName  = "Nested MNL, image fixed effects",
+  modelDescr = "Paired-choice nested logit",
+  indivID    = "uniqueID",
+  panelData  = TRUE,
+  nCores     = 4
+)
+
+apollo_beta <- c(
+  b_intercept_NV  = 0,
+  b_intercept_NPV = 0,
+  b_intercept_IPV = 0,
+  b_intercept_RPV = 0,
+  
+  b_treat_NPV  = 0,
+  b_treat_IPV = 0,
+  b_treat_RPV = 0,
+  
+  b_polId_NPV  = 0,
+  b_polId_IPV = 0,
+  b_polId_RPV = 0,
+  
+  b_interaction_NPV  = 0,
+  b_interaction_IPV = 0,
+  b_interaction_RPV = 0,
+  
+  b_trial_NPV  = 0,
+  b_trial_IPV = 0,
+  b_trial_RPV = 0,
+  
+  b_treat_trial_NPV  = 0,
+  b_treat_trial_IPV = 0,
+  b_treat_trial_RPV = 0,
+  
+  b_age_NPV  = 0,
+  b_age_IPV = 0,
+  b_age_RPV = 0,
+  
+  b_male_NPV  = 0,
+  b_male_IPV = 0,
+  b_male_RPV = 0,
+  
+  # Unrestricted parameters determining the nesting scales
+  eta_nest1 = qlogis(0.99),
+  eta_nest2 = qlogis(0.99)
+)
+
+imageDummies <- uniqueImages[!startsWith(uniqueImages, "1_")]
+
+dummiesNV  <- imageDummies[endsWith(imageDummies, "NV")]
+dummiesNPV <- imageDummies[endsWith(imageDummies, "NPV")]
+dummiesIPV <- imageDummies[endsWith(imageDummies, "IPV")]
+dummiesRPV <- imageDummies[endsWith(imageDummies, "RPV")]
+
+dummyList <- list(
+  NV  = dummiesNV,
+  NPV = dummiesNPV,
+  IPV = dummiesIPV,
+  RPV = dummiesRPV
+)
+
+apollo_beta <- c(
+  apollo_beta,
+  setNames(
+    rep(0, length(imageDummies)),
+    paste0("b_img", imageDummies)
+  )
+)
+
+apollo_fixed <- "b_intercept_NV"
+
+apollo_probabilities <- function(
+    apollo_beta,
+    apollo_inputs,
+    functionality = "estimate"
+) {
+  
+  apollo_attach(apollo_beta, apollo_inputs)
+  on.exit(
+    apollo_detach(apollo_beta, apollo_inputs),
+    add = TRUE
+  )
+  
+  # Utilities: NV is the reference alternative
+  V <- list(
+    NV = b_intercept_NV,
+    
+    NPV = b_intercept_NPV +
+      b_age_NPV * age +
+      b_male_NPV * male +
+      b_treat_NPV * treat +
+      b_polId_NPV * polId +
+      b_trial_NPV * logTrial +
+      b_interaction_NPV * treat * polId +
+      b_treat_trial_NPV * treat * logTrial,
+    
+    IPV = b_intercept_IPV +
+      b_age_IPV * age +
+      b_male_IPV * male +
+      b_treat_IPV * treat +
+      b_polId_IPV * polId +
+      b_trial_IPV * logTrial +
+      b_interaction_IPV * treat * polId +
+      b_treat_trial_IPV * treat * logTrial,
+    
+    RPV = b_intercept_RPV +
+      b_age_RPV * age +
+      b_male_RPV * male +
+      b_treat_RPV * treat +
+      b_polId_RPV * polId +
+      b_trial_RPV * logTrial +
+      b_interaction_RPV * treat * polId +
+      b_treat_trial_RPV * treat * logTrial
+  )
+  
+  for (cat in c("NV", "NPV", "IPV", "RPV")) {
+    for(img in apollo_inputs$dummyList[[cat]]) {
+      V[[cat]] <- V[[cat]] +
+        get(paste0("b_img", img)) * get(img)
+    }
+  }
+  
+  # Enforce 0 < lambda_nest2 < lambda_nest1 < 1
+  lambda_nest1 <- 1 / (1 + exp(-eta_nest1))
+  
+  lambda_nest2 <- lambda_nest1 *
+    (1 / (1 + exp(-eta_nest2)))
+  
+  nl_settings <- list(
+    alternatives = c(
+      NV  = 1,
+      NPV = 2,
+      IPV = 3,
+      RPV = 4
+    ),
+    
+    avail = list(
+      NV  = isNV,
+      NPV = isNPV,
+      IPV = isIPV,
+      RPV = isRPV
+    ),
+    
+    choiceVar = choice,
+    utilities = V,
+    
+    nlNests = list(
+      root  = 1,
+      nest1 = lambda_nest1,
+      nest2 = lambda_nest2
+    ),
+    
+    nlStructure = list(
+      root  = c("NV", "nest1"),
+      nest1 = c("NPV", "nest2"),
+      nest2 = c("IPV", "RPV")
+    )
+  )
+  
+  P <- list()
+  
+  P[["model"]] <- apollo_nl(
+    nl_settings,
+    functionality
+  )
+  
+  P <- apollo_panelProd(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  P <- apollo_prepareProb(
+    P,
+    apollo_inputs,
+    functionality
+  )
+  
+  return(P)
+}
+
+apollo_inputs <- apollo_validateInputs(
+  apollo_beta    = apollo_beta,
+  apollo_fixed   = apollo_fixed,
+  database       = dataLong,
+  apollo_control = apollo_control,
+  recycle        = FALSE
+)
+
+apollo_inputs$dummyList <- dummyList
+
+fixedEffectsFit <- apollo_estimate(
+  apollo_beta,
+  apollo_fixed,
+  apollo_probabilities,
+  apollo_inputs
+)
+
+apollo_modelOutput(fixedEffectsFit)
+
+# Recover the estimated nesting scales
+lambda_nest1_hat <- plogis(
+  fixedEffectsFit$estimate[["eta_nest1"]]
+)
+
+lambda_nest2_hat <- lambda_nest1_hat * plogis(
+  fixedEffectsFit$estimate[["eta_nest2"]]
+)
+
+c(
+  lambda_nest1 = lambda_nest1_hat,
+  lambda_nest2 = lambda_nest2_hat
+)
+
+
+make_contrast <- function(a, b, inverse_scale) {
+  
+  prefixes <- c(
+    intercept         = "b_intercept",
+    age               = "b_age",
+    male              = "b_male",
+    treat             = "b_treat",
+    polId             = "b_polId",
+    interaction       = "b_interaction",
+    trial             = "b_trial",
+    treat_trial       = "b_treat_trial"
+  )
+  
+  # Include only terms estimated for both alternatives.
+  # This accommodates models with or without polId × trial.
+  included <- vapply(
+    prefixes,
+    function(prefix) {
+      all(
+        paste0(prefix, "_", c(a, b)) %in%
+          names(fixedEffectsFit$estimate)
+      )
+    },
+    logical(1)
+  )
+  
+  prefixes <- prefixes[included]
+  
+  expressions <- sprintf(
+    "(%s_%s - %s_%s) * (%s)",
+    prefixes, a,
+    prefixes, b,
+    inverse_scale
+  )
+  
+  setNames(
+    expressions,
+    paste(a, b, names(prefixes), sep = "_SEP_")
+  )
+}
+
+contrast_expressions <- c(
+  make_contrast(
+    "IPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "NPV",
+    "1 + exp(-eta_nest1)"
+  ),
+  
+  make_contrast(
+    "RPV", "IPV",
+    "(1 + exp(-eta_nest1)) * (1 + exp(-eta_nest2))"
+  )
+)
+
+contrast_results <- apollo_deltaMethod(
+  fixedEffectsFit,
+  list(
+    expression = contrast_expressions,
+    varcov = "robust",
+    printPVal = 2
+  )
+)
+```
+
+```{r}
+
+outcomeLevels <- c(
+  "NV",
+  "NPV",
+  "IPV",
+  "RPV"
+)
+
+outcomeLabels <- c(
+  "NV",
+  "NPV",
+  "IPV",       
+  "RPV"
+)
+
+termLevels <- c(
+  "treat",
+  "treat_trial",
+  "polId",       
+  "polId_trial",
+  "interaction",   
+  "interaction_trial",
+  "trial",
+  "male",
+  "age",
+  "intercept"
+)
+
+termLabels <- c(
+  "Treatment",
+  "Treatment × Trial",
+  "Left-Right (C)",       
+  "Left-Right × Trial",
+  "Treatment × Left-Right",
+  "Treatment × Left-Right × Trial",
+  "Trial",
+  "Male",
+  "Age",
+  "Intercept"
+)
+
+fixedEffectsTable <- apollo_modelOutput(
+  fixedEffectsFit,
+  list(
+    printClassical = FALSE,
+    printRobust    = TRUE,
+    printPVal      = 2,
+    printFixed     = FALSE
+  )
+)
+
+lambda1 <- 1 / (1 + exp(-fixedEffectsTable["eta_nest1", "Estimate"]))
+lambda2 <- lambda1 * 1 / (1 + exp(-fixedEffectsTable["eta_nest2", "Estimate"]))
+
+
+model_info <- tibble::tibble(
+  clusters = fixedEffectsFit$nIndivs,
+  obs = fixedEffectsFit$nObs,
+  equalPseudoR2 = fixedEffectsFit$rho2_0,
+  interceptsPseudoR2 = as.numeric(
+    1 - fixedEffectsFit$maximum / interceptFit$maximum
+  )
+)
+
+
+fixedEffectsDelta <- tibble::as_tibble(contrast_results) %>%
+  tidyr::separate_wider_delim(
+    Expression,
+    delim = "_SEP_",
+    names = c("Outcome", "Panel", "Term")
+  ) %>%
+  rename(
+    Estimate = Value,
+    se = s.e.,
+    t = `t-ratio (0)`,
+    p = `p(2-sided)`
+  )
+
+fixedEffectsTable <- tibble::as_tibble(
+  fixedEffectsTable,
+  rownames = "Term"
+) %>%
+  filter(!startsWith(Term, "eta")) %>%
+  filter(!(Term %in% paste0("b_img", imageDummies))) %>%
+  mutate(
+    Panel = "NV",
+    Outcome = str_extract(Term, "[^_]*$"),
+    Term = str_remove(str_remove(Term, "_[^_]*$"), "^[^_]*_")
+  ) %>%
+  rename(
+    se = Rob.s.e.,
+    t = `Rob.t.rat.(0)`,
+    p = `p(2-sided)`
+  ) %>%
+  dplyr::bind_rows(fixedEffectsDelta) %>%
+  mutate(
+    Term = factor(
+      Term, levels = termLevels, labels = termLabels
+    ),
+    Outcome = factor(
+      Outcome, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    Panel = factor(
+      Panel, levels = outcomeLevels, labels = outcomeLabels
+    ),
+    stars = case_when(
+      p <= 0.001 ~ "***",
+      p <= 0.01  ~ "**",
+      p <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      p < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", p)))
+    ),
+    Estimate = sprintf(
+      "%.3f%s<br>(%.3f)<br>p%s",
+      Estimate, stars, se, pFormatted
+    )
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = Term,
+    names_from = c(Panel, Outcome),
+    values_from = Estimate,
+    names_sep = "_",
+    names_expand = FALSE
+  ) %>%
+  arrange(Term)
+
+fixedEffectsGT <- fixedEffectsTable %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NV",
+    columns = starts_with("NV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NPV",
+    columns = starts_with("NPV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: IPV",
+    columns = starts_with("IPV")
+  ) %>%
+  gt::cols_label(
+    ends_with("NPV") ~ "NPV",
+    ends_with("IPV") ~ "IPV",
+    ends_with("RPV") ~ "RPV"
+  ) %>%
+  gt::fmt_markdown(
+    columns = -Term
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = -Term
+  ) %>%
+  gt::sub_missing(
+    columns = -Term,
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(weight = "bold"),
+    locations = gt::cells_row_groups(
+      groups = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0)
+  )
+
+fixedEffectsGT
+
+if(export) {
+  fixedEffectsGT_png <- fixedEffectsGT %>%
+    gt::tab_options(
+      table.width = gt::px(624)
+    )
+  
+  gt::gtsave(
+    fixedEffectsGT_png,
+    filename = "../Tables/fixedEffectsTable.png",
+    zoom = 3.125,
+    expand = 0
+  ) 
+}
+```
+
+## Duration models
+
+### Helpers
+
+```{r}
+
+coxExtractor <- function(coxFit, data) {
+  
+  predictors <- attr(coxFit$terms, "term.labels")
+  
+  modelVariables <- predictors[
+    !grepl("^(strata|cluster|tt)\\(|:", predictors)
+  ]
+  
+  used <- data %>%
+    dplyr::filter(
+      if_all(all_of(modelVariables), ~ !is.na(.x))
+    )
+  
+  n_distinct(used$uniqueID)
+}
+
+processCoxFun <- function(coxFit, modelName, data) {
+  nRisk <- coxFit$n
+  nClusters <- coxExtractor(coxFit=coxFit, data=data)
+  rsq <- summary(coxFit)$rsq
+  r2 <- unname(rsq["rsq"] / rsq["maxrsq"])
+  
+  processed <- as.data.frame(summary(coxFit)$coefficients) %>%
+    tibble::rownames_to_column("Term") %>%
+    rename(
+      Estimate=coef,
+      SE = `robust se`,
+      Z = z,
+      P = `Pr(>|z|)`
+    ) %>%
+    mutate(
+      Response="Choice",
+      Model=modelName,
+      Panel="Coefficients",
+    ) %>%
+    select(Response, Model, Panel, Term, Estimate, SE, Z, P) %>%
+    dplyr::bind_rows(
+      tibble(
+        Response="Choice",
+        Model=modelName,
+        Panel="Info",
+        Term=c("Concordance", "Nagelkerke R2", "N", "Events", "Clusters"),
+        Estimate=c(coxFit$concordance[["concordance"]], r2, nRisk, coxFit$nevent, nClusters),
+        SE=c(coxFit$concordance[["std"]], rep(NA_real_, times=4)),
+        Z=NA_real_,
+        P=NA_real_
+      )
+    )
+  
+  return(processed)
+}
+```
+
+### Controls
+
+```{r}
+
+predictors <- c(
+  "1",
+  "treat",
+  "polId",
+  "treat * polId",
+  "blockTwo",
+  "logTrial",
+  "logTrial*blockTwo",
+  "male",
+  "age",
+  "traitAnger",
+  "SES",
+  "studyOrder",
+  "cluster(uniqueID)"
+)
+
+syntax <- paste0(
+  "Surv(rt_ms, event) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxControls <- coxph(
+  as.formula(syntax),
+  data = dataLong,
+  ties = "efron"
+)
+
+summary(coxControls)
+```
+
+### NPV vs NV
+
+```{r}
+
+set.seed(masterSeed)
+
+predictors <- c(
+  "treat * polId * IPV_NV",
+  "treat * polId * RPV_NV",
+  "treat * polId * IPV_NPV",
+  "treat * polId * RPV_NPV",
+  "treat * polId * RPV_IPV",
+  
+  "logTrial * blockTwo * IPV_NV",
+  "logTrial * blockTwo * RPV_NV",
+  "logTrial * blockTwo * IPV_NPV",
+  "logTrial * blockTwo * RPV_NPV",
+  "logTrial * blockTwo * RPV_IPV",
+  
+  "logTrial * treat * IPV_NV",
+  "logTrial * treat * RPV_NV",
+  "logTrial * treat * IPV_NPV",
+  "logTrial * treat * RPV_NPV",
+  "logTrial * treat * RPV_IPV",
+  
+  "male * IPV_NV",
+  "male * RPV_NV",
+  "male * IPV_NPV",
+  "male * RPV_NPV",
+  "male * RPV_IPV",
+
+  "age * IPV_NV",
+  "age * RPV_NV",
+  "age * IPV_NPV",
+  "age * RPV_NPV",
+  "age * RPV_IPV",
+
+  "cluster(uniqueID)"
+)
+
+syntax <- paste0(
+  "Surv(rt_ms, event) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxNPV_NV <- coxph(
+  as.formula(syntax),
+  data = dataLong,
+  ties = "efron"
+)
+
+coxTableNPV_NV <- processCoxFun(coxNPV_NV, modelName="NPV_NV", data=dataLong)
+```
+
+### IPV vs NV 
+
+```{r}
+
+set.seed(masterSeed)
+
+predictors <- c(
+  
+  "treat * polId * NPV_NV",
+  "treat * polId * RPV_NV",
+  "treat * polId * IPV_NPV",
+  "treat * polId * RPV_NPV",
+  "treat * polId * RPV_IPV",
+  
+  "logTrial * blockTwo * NPV_NV",
+  "logTrial * blockTwo * RPV_NV",
+  "logTrial * blockTwo * IPV_NPV",
+  "logTrial * blockTwo * RPV_NPV",
+  "logTrial * blockTwo * RPV_IPV",
+  
+  "logTrial * treat * NPV_NV",
+  "logTrial * treat * RPV_NV",
+  "logTrial * treat * IPV_NPV",
+  "logTrial * treat * RPV_NPV",
+  "logTrial * treat * RPV_IPV",
+  
+  "male * NPV_NV",
+  "male * RPV_NV",
+  "male * IPV_NPV",
+  "male * RPV_NPV",
+  "male * RPV_IPV",
+  
+  "age * NPV_NV",
+  "age * RPV_NV",
+  "age * IPV_NPV",
+  "age * RPV_NPV",
+  "age * RPV_IPV",
+  
+  "cluster(uniqueID)"
+)
+
+syntax <- paste0(
+  "Surv(rt_ms, event) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxIPV_NV <- coxph(
+  as.formula(syntax),
+  data = dataLong,
+  ties = "efron"
+)
+
+coxTableIPV_NV <- processCoxFun(coxIPV_NV, modelName="IPV_NV", data=dataLong)
+```
+
+### RPV vs NV
+
+```{r}
+
+set.seed(masterSeed)
+
+predictors <- c(
+  
+  "treat * polId * NPV_NV",
+  "treat * polId * IPV_NV",
+  "treat * polId * IPV_NPV",
+  "treat * polId * RPV_NPV",
+  "treat * polId * RPV_IPV",
+  
+  "logTrial * blockTwo * NPV_NV",
+  "logTrial * blockTwo * IPV_NV",
+  "logTrial * blockTwo * IPV_NPV",
+  "logTrial * blockTwo * RPV_NPV",
+  "logTrial * blockTwo * RPV_IPV",
+  
+  "logTrial * treat * NPV_NV",
+  "logTrial * treat * IPV_NV",
+  "logTrial * treat * IPV_NPV",
+  "logTrial * treat * RPV_NPV",
+  "logTrial * treat * RPV_IPV",
+  
+  "male * NPV_NV",
+  "male * IPV_NV",
+  "male * IPV_NPV",
+  "male * RPV_NPV",
+  "male * RPV_IPV",
+  
+  "age * NPV_NV",
+  "age * IPV_NV",
+  "age * IPV_NPV",
+  "age * RPV_NPV",
+  "age * RPV_IPV",
+  
+  "cluster(uniqueID)"
+)
+
+syntax <- paste0(
+  "Surv(rt_ms, event) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxRPV_NV <- coxph(
+  as.formula(syntax),
+  data = dataLong,
+  ties = "efron"
+)
+
+coxTableRPV_NV <- processCoxFun(coxRPV_NV, modelName="RPV_NV", data=dataLong)
+```
+
+### IPV vs NPV 
+
+```{r}
+
+set.seed(masterSeed)
+
+predictors <- c(
+  
+  "treat * polId * NPV_NV",
+  "treat * polId * IPV_NV",
+  "treat * polId * RPV_NV",
+  "treat * polId * RPV_NPV",
+  "treat * polId * RPV_IPV",
+  
+  "logTrial * blockTwo * NPV_NV",
+  "logTrial * blockTwo * IPV_NV",
+  "logTrial * blockTwo * RPV_NV",
+  "logTrial * blockTwo * RPV_NPV",
+  "logTrial * blockTwo * RPV_IPV",
+  
+  "logTrial * treat * NPV_NV",
+  "logTrial * treat * IPV_NV",
+  "logTrial * treat * RPV_NV",
+  "logTrial * treat * RPV_NPV",
+  "logTrial * treat * RPV_IPV",
+  
+  "male * NPV_NV",
+  "male * IPV_NV",
+  "male * RPV_NV",
+  "male * RPV_NPV",
+  "male * RPV_IPV",
+  
+  "age * NPV_NV",
+  "age * IPV_NV",
+  "age * RPV_NV",
+  "age * RPV_NPV",
+  "age * RPV_IPV",
+
+  "cluster(uniqueID)"
+)
+
+syntax <- paste0(
+  "Surv(rt_ms, event) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxIPV_NPV <- coxph(
+  as.formula(syntax),
+  data = dataLong,
+  ties = "efron"
+)
+
+coxTableIPV_NPV <- processCoxFun(coxIPV_NPV, modelName="IPV_NPV", data=dataLong)
+```
+
+### RPV vs NPV 
+
+```{r}
+
+set.seed(masterSeed)
+
+predictors <- c(
+  
+  "treat * polId * NPV_NV",
+  "treat * polId * IPV_NV",
+  "treat * polId * RPV_NV",
+  "treat * polId * IPV_NPV",
+  "treat * polId * RPV_IPV",
+  
+  "logTrial * blockTwo * NPV_NV",
+  "logTrial * blockTwo * IPV_NV",
+  "logTrial * blockTwo * RPV_NV",
+  "logTrial * blockTwo * IPV_NPV",
+  "logTrial * blockTwo * RPV_IPV",
+  
+  "logTrial * treat * NPV_NV",
+  "logTrial * treat * IPV_NV",
+  "logTrial * treat * RPV_NV",
+  "logTrial * treat * IPV_NPV",
+  "logTrial * treat * RPV_IPV",
+  
+  "male * NPV_NV",
+  "male * IPV_NV",
+  "male * RPV_NV",
+  "male * IPV_NPV",
+  "male * RPV_IPV",
+  
+  "age * NPV_NV",
+  "age * IPV_NV",
+  "age * RPV_NV",
+  "age * IPV_NPV",
+  "age * RPV_IPV",
+  
+  "cluster(uniqueID)"
+)
+
+syntax <- paste0(
+  "Surv(rt_ms, event) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxRPV_NPV <- coxph(
+  as.formula(syntax),
+  data = dataLong,
+  ties = "efron"
+)
+
+coxTableRPV_NPV <- processCoxFun(coxRPV_NPV, modelName="RPV_NPV", data=dataLong)
+```
+
+### RPV vs IPV 
+
+```{r}
+
+set.seed(masterSeed)
+
+predictors <- c(
+  "treat * polId * NPV_NV",
+  "treat * polId * IPV_NV",
+  "treat * polId * RPV_NV",
+  "treat * polId * IPV_NPV",
+  "treat * polId * RPV_NPV",
+  
+  "logTrial * blockTwo * NPV_NV",
+  "logTrial * blockTwo * IPV_NV",
+  "logTrial * blockTwo * RPV_NV",
+  "logTrial * blockTwo * IPV_NPV",
+  "logTrial * blockTwo * RPV_NPV",
+  
+  "logTrial * treat * NPV_NV",
+  "logTrial * treat * IPV_NV",
+  "logTrial * treat * RPV_NV",
+  "logTrial * treat * IPV_NPV",
+  "logTrial * treat * RPV_NPV",
+  
+  "male * NPV_NV",
+  "male * IPV_NV",
+  "male * RPV_NV",
+  "male * IPV_NPV",
+  "male * RPV_NPV",
+  
+  "age * NPV_NV",
+  "age * IPV_NV",
+  "age * RPV_NV",
+  "age * IPV_NPV",
+  "age * RPV_NPV",
+  
+  "cluster(uniqueID)"
+)
+
+syntax <- paste0(
+  "Surv(rt_ms, event) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxRPV_IPV <- coxph(
+  as.formula(syntax),
+  data = dataLong,
+  ties = "efron"
+)
+
+coxTableRPV_IPV <- processCoxFun(coxRPV_IPV, modelName="RPV_IPV", data=dataLong)
+```
+
+### Table
+
+```{r}
+
+termLevels <- c(
+  "treat",
+  "treat:logTrial",
+  "polId",
+  "treat:polId",
+  "blockTwo",
+  "logTrial",
+  "logTrial:blockTwo",
+  "male",
+  "age",
+  "Concordance",
+  "Nagelkerke R2",
+  "N",
+  "Events",
+  "Clusters"
+)
+
+
+termLabels <- c(
+  "Treatment",
+  "Treatment × Trial",
+  "Left-Right (C)",       
+  "Treatment × Left-Right",
+  "Block Two",
+  "Trial",
+  "Trial × Block Two",
+  "Male",
+  "Age",
+  "Concordance",
+  "Nagelkerke-R²",
+  "N",
+  "Events",
+  "Clusters"
+)
+
+modelLabels <- c("NPV_NV", "IPV_NV", "RPV_NV", "IPV_NPV", "RPV_NPV", "RPV_IPV")
+
+coxTable <- dplyr::bind_rows(
+  coxTableNPV_NV,
+  coxTableIPV_NV,
+  coxTableRPV_NV,
+  coxTableIPV_NPV,
+  coxTableRPV_NPV,
+  coxTableRPV_IPV
+) %>%
+  filter(
+    Term %in% termLevels
+  ) %>%
+  group_by(Response, Model, Panel, Term) %>%
+  mutate(
+    stars = case_when(
+      P <= 0.001 ~ "***",
+      P <= 0.01  ~ "**",
+      P <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      P < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", P)))
+    ),
+    Estimate = case_when(
+      Panel == "Coefficients" ~ sprintf(
+        "%.3f%s<br>(%.3f)<br>p%s",
+        Estimate, stars, SE, pFormatted
+      ),
+      Term %in% c("Concordance", "Nagelkerke R2") ~ sprintf("%.3f", Estimate),
+      .default = sprintf("%.0f", Estimate)
+    ),
+    Panel = factor(
+      Panel,
+      levels = c("Coefficients", "Info"),
+      labels = c("Coefficients", "Model information")
+    ),
+    Term = factor(
+      Term, 
+      levels = termLevels,
+      labels = termLabels
+    )
+  )
+
+coxTable <- coxTable %>%
+  ungroup() %>%
+  dplyr::select(
+    Panel,
+    Term,
+    Model,
+    Estimate
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = c(Panel, Term),
+    names_from = Model,
+    values_from = Estimate
+  ) %>%
+  arrange(Panel, Term)
+
+coxGT <- coxTable %>%
+  dplyr::select(-Panel) %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NV",
+    columns = ends_with("NV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: NPV",
+    columns = ends_with("NPV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Ref: IPV",
+    columns = ends_with("IPV")
+  ) %>%
+  gt::tab_spanner(
+    label = "Choice (hazard)",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_label(
+    starts_with("NPV") ~ "NPV",
+    starts_with("IPV") ~ "IPV",
+    starts_with("RPV") ~ "RPV"
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Choice (hazard)"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "Concordance"
+      ),
+      gt::cells_body(
+        rows = Term == "Concordance"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+coxGT <- coxGT %>%
+  gt::tab_options(
+    table.width = gt::px(624)
+  )
+
+gt::gtsave(
+  coxGT,
+  filename = "../Tables/coxTable.png",
+  zoom = 3.125,
+  expand = 0
+)
+
+coxGT
+```
