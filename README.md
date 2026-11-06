@@ -6,7 +6,7 @@ Replication package for **“Anger and the acceptance of political violence.”*
 
 ## Replication materials
 
-The replication package is being prepared. Analysis code, supporting files, software requirements, and instructions for reproducing the results will be added as they become available. Scripts may be examined but data will not be made available until publication.
+The replication package is being prepared. Analysis code, supporting files, software requirements, and instructions for reproducing the results will be added as they become available. Scripts may be examined but data will not be made available until manuscript submission.
 
 ## Contact
 
